@@ -3,7 +3,7 @@ from services.geoloc_service import get_coordinates
 
 from services.processamento_dados import normalizar_dados_entrada, aplicar_regras_alocacao
 from services.osrm_service import criar_matriz_distancias
-from services.ortools import resolver_vrp_ortools, Truck, Order, plan_day_two_stage
+from services.ortools import resolver_vrp_ortools, Truck, Order, plan_day_two_stage, PedidoRealocado
 
 app = Flask(__name__)
 
@@ -87,6 +87,13 @@ def _parse_orders(payload):
 
 
 def _solve_payload_v2(payload):
+    from config.settings import (
+        OSRM_URL, 
+        MAX_KM_ADICIONAL_REALOCACAO, 
+        PRIORIDADE_MENOR_KM_ADICIONAL, 
+        PRIORIDADE_MAIS_PERTO
+    )
+    
     depot = payload.get('depot')
     if not isinstance(depot, dict):
         raise ValueError("Campo 'depot' {x,y} é obrigatório")
@@ -100,7 +107,7 @@ def _solve_payload_v2(payload):
     depot_coords = (_as_float(depot.get('y')), _as_float(depot.get('x')))  # (lat, lng)
 
     params = payload.get('params') if isinstance(payload.get('params'), dict) else {}
-    res1, res2 = plan_day_two_stage(
+    res1, res2, pedidos_realocados = plan_day_two_stage(
         orders=orders,
         trucks=trucks,
         depot_xy=depot_xy,
@@ -109,6 +116,13 @@ def _solve_payload_v2(payload):
         stage2_drop_penalty=_as_int(params.get('stage2_drop_penalty'), default=2_000_000),
         stage2_move_penalty=_as_int(params.get('stage2_move_penalty'), default=200_000),
         time_limit_seconds=_as_int(params.get('time_limit_seconds'), default=10),
+        # Novos parâmetros para realocação inteligente
+        max_km_adicional_realocacao=_as_float(params.get('max_km_adicional_realocacao'), default=MAX_KM_ADICIONAL_REALOCACAO),
+        prioridade_menor_km=PRIORIDADE_MENOR_KM_ADICIONAL,
+        prioridade_mais_perto=PRIORIDADE_MAIS_PERTO,
+        osrm_url=OSRM_URL,
+        order_coords=order_coords,
+        depot_coords=depot_coords,
     )
 
     def _calcular_distancia_rota_osrm(order_ids):
@@ -187,7 +201,32 @@ def _solve_payload_v2(payload):
         print(f"⏸️  Não utilizados ({len(trucks_nao_usados)}): {', '.join(sorted(trucks_nao_usados, key=lambda x: int(x) if x.isdigit() else x))}", flush=True)
     print(f"{'='*50}\n", flush=True)
 
-    return {'stage1': pack_result(res1), 'stage2': pack_result(res2)}
+    # Formatar pedidos_realocados para o retorno JSON
+    pedidos_realocados_json = [
+        {
+            'id': pr.id,
+            'cidade': pr.cidade,
+            'caminhao_original': pr.caminhao_original,
+            'caminhao_realocado': pr.caminhao_realocado,
+            'distancia_adicional_km': pr.distancia_adicional_km,
+            'peso_kg': pr.peso_kg,
+            'motivo': pr.motivo,
+        }
+        for pr in pedidos_realocados
+    ]
+    
+    if pedidos_realocados:
+        print(f"\n{'='*50}", flush=True)
+        print(f"🔄 PEDIDOS REALOCADOS: {len(pedidos_realocados)}", flush=True)
+        for pr in pedidos_realocados:
+            print(f"   📦 {pr.id} ({pr.cidade}): Caminhão {pr.caminhao_original} → {pr.caminhao_realocado} (+{pr.distancia_adicional_km}km)", flush=True)
+        print(f"{'='*50}\n", flush=True)
+
+    return {
+        'stage1': pack_result(res1), 
+        'stage2': pack_result(res2),
+        'pedidos_realocados': pedidos_realocados_json,
+    }
 
 @app.route('/geoloc', methods=['POST'])
 def get_geolocation():

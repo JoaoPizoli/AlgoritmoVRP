@@ -18,10 +18,18 @@ PENALIDADE_DE_DROP = 10_000_000
 # Tempo máximo que a IA ficará pensando (em segundos).
 TEMPO_LIMITE_SOLVER_SEGUNDOS = 60
 
-# Raio de "Vizinhança" para rotas excedentes (em metros)
-# Se um caminhão passa a menos de X km de um pedido excedente, ele pode pegá-lo
-# mesmo que a cidade não seja sua "nativa".
-MAX_DISTANCIA_VIZINHANCA_METROS = 80_000 # 80km
+# =============================================================================
+# REALOCAÇÃO DE EXCEDENTES (Etapa 2)
+# =============================================================================
+
+# Máximo de KM adicionais permitidos ao realocar um excedente para outro caminhão
+# Se adicionar o pedido aumentar a rota em mais que esse valor, não realoca
+MAX_KM_ADICIONAL_REALOCACAO = 50  # 50km
+
+# Critério de prioridade para escolher qual caminhão recebe o excedente
+# (apenas um deve ser True por vez)
+PRIORIDADE_MENOR_KM_ADICIONAL = True   # Escolhe o caminhão que resulta em menor km adicional
+PRIORIDADE_MAIS_PERTO = False          # Escolhe o caminhão mais próximo do pedido
 
 # Estratégia de Busca Local (Metaheurística)
 METODO_BUSCA_LOCAL = 'GUIDED_LOCAL_SEARCH' 

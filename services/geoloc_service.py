@@ -1,6 +1,9 @@
 import googlemaps
+from dotenv import load_dotenv
+load_dotenv()
+import os
 
-gmaps = googlemaps.Client(key="AIzaSyC8moNSB7lRDY3FNJ-Lk0oeJ7uP82kp1-0")
+gmaps = googlemaps.Client(os.getenv("GOOGLE_API"))
 
 
 def get_coordinates(rua: str, cidade: str) -> dict:
