@@ -24,7 +24,7 @@ TEMPO_LIMITE_SOLVER_SEGUNDOS = 60
 
 # Máximo de KM adicionais permitidos ao realocar um excedente para outro caminhão
 # Se adicionar o pedido aumentar a rota em mais que esse valor, não realoca
-MAX_KM_ADICIONAL_REALOCACAO = 50  # 50km
+MAX_KM_ADICIONAL_REALOCACAO = 150  # 50km
 
 # Critério de prioridade para escolher qual caminhão recebe o excedente
 # (apenas um deve ser True por vez)
