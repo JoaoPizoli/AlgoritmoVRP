@@ -41,7 +41,7 @@ METODO_BUSCA_LOCAL = 'GUIDED_LOCAL_SEARCH'
 OSRM_URL = "http://192.168.20.17:4000"
 
 # Timeout para a requisição HTTP (evita que o sistema trave se o OSRM cair)
-OSRM_TIMEOUT_SECONDS = 120
+OSRM_TIMEOUT_SECONDS = 240
 
 # Tamanho do lote para cálculo de matriz (para não estourar a URL GET)
 # Se tiver 100 pedidos, ele quebra em pedaços de 50x50.
