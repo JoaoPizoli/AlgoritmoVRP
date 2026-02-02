@@ -361,13 +361,7 @@ def ordenar_redespacho():
         
         return jsonify({
             "sucesso": True,
-            "ordem_entrega": ordem_entrega,
-            "total_pontos": len(ordem_entrega),
-            "distancia_total_km": round(distancia_total, 2),
-            "distancia_retorno_km": round(distancia_retorno, 2),
-            "distancia_total_com_retorno_km": round(distancia_total_com_retorno, 2),
-            "distancias_acumuladas_km": distancias_acumuladas,
-            "ponto_partida": "Mococa"
+            "ordem_entrega": ordem_entrega
         }), 200
         
     except Exception as e:
