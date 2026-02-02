@@ -563,6 +563,114 @@ def _calcular_distancia_euclidiana(coord1: Tuple[float, float], coord2: Tuple[fl
     return math.sqrt(dlat**2 + dlng**2)
 
 
+def reordenar_rota_tsp(
+    order_ids: List[str],
+    order_coords: Dict[str, Tuple[float, float]],
+    depot_coords: Tuple[float, float],
+    osrm_url: str = "http://router.project-osrm.org",
+) -> List[str]:
+    """
+    Reordena pedidos de uma rota usando TSP via OR-Tools.
+    Retorna a sequência otimizada de IDs.
+    
+    Args:
+        order_ids: Lista de IDs dos pedidos na rota
+        order_coords: Dict order_id -> (lat, lng)
+        depot_coords: (lat, lng) do depósito
+        osrm_url: URL do servidor OSRM
+    
+    Returns:
+        Lista de order_ids na sequência otimizada
+    """
+    import requests
+    
+    if len(order_ids) <= 1:
+        return order_ids
+    
+    # Montar lista de coordenadas: [depot, order1, order2, ...]
+    coords_list = [depot_coords]
+    valid_ids = []
+    for oid in order_ids:
+        if oid in order_coords:
+            coords_list.append(order_coords[oid])
+            valid_ids.append(oid)
+    
+    if len(valid_ids) <= 1:
+        return order_ids
+    
+    n = len(coords_list)  # depot + pedidos
+    
+    # Tentar obter matriz de distância via OSRM
+    try:
+        coords_str = ";".join([f"{lng},{lat}" for lat, lng in coords_list])
+        url = f"{osrm_url}/table/v1/driving/{coords_str}?annotations=distance"
+        r = requests.get(url, timeout=30)
+        
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('code') == 'Ok' and data.get('distances'):
+                cost_matrix = [[int(d) if d is not None else 10_000_000 for d in row] 
+                               for row in data['distances']]
+            else:
+                # Fallback para distância euclidiana
+                cost_matrix = _build_euclidean_matrix(coords_list)
+        else:
+            cost_matrix = _build_euclidean_matrix(coords_list)
+    except Exception as e:
+        print(f"[WARN] OSRM falhou para TSP, usando euclidiana: {e}", flush=True)
+        cost_matrix = _build_euclidean_matrix(coords_list)
+    
+    # Resolver TSP com OR-Tools
+    manager = pywrapcp.RoutingIndexManager(n, 1, 0)  # 1 veículo, depot no index 0
+    routing = pywrapcp.RoutingModel(manager)
+    
+    def distance_callback(from_index, to_index):
+        from_node = manager.IndexToNode(from_index)
+        to_node = manager.IndexToNode(to_index)
+        return cost_matrix[from_node][to_node]
+    
+    transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+    routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+    
+    # Parâmetros de busca
+    search_params = pywrapcp.DefaultRoutingSearchParameters()
+    search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+    search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    search_params.time_limit.FromSeconds(5)  # Limite curto pois é só 1 rota
+    
+    solution = routing.SolveWithParameters(search_params)
+    
+    if solution:
+        # Extrair sequência otimizada
+        index = routing.Start(0)
+        ordered_ids = []
+        while not routing.IsEnd(index):
+            node = manager.IndexToNode(index)
+            if node > 0:  # Pular depot (node 0)
+                ordered_ids.append(valid_ids[node - 1])
+            index = solution.Value(routing.NextVar(index))
+        return ordered_ids
+    else:
+        # Se não conseguiu resolver, retorna ordem original
+        return order_ids
+
+
+def _build_euclidean_matrix(coords_list: List[Tuple[float, float]]) -> List[List[int]]:
+    """Constrói matriz de distância euclidiana em metros."""
+    n = len(coords_list)
+    matrix = []
+    for i in range(n):
+        row = []
+        for j in range(n):
+            if i == j:
+                row.append(0)
+            else:
+                dist = _calcular_distancia_euclidiana(coords_list[i], coords_list[j])
+                row.append(int(dist * 1000))  # km -> metros
+        matrix.append(row)
+    return matrix
+
+
 def realocar_excedentes_inteligente(
     res_etapa1: SolveResult,
     orders: List[Order],
@@ -725,6 +833,39 @@ def realocar_excedentes_inteligente(
     print(f"   ✅ Realocados: {len(pedidos_realocados)}", flush=True)
     print(f"   ⚠️ Excedentes finais: {len(excedentes_finais)}", flush=True)
     print(f"{'='*50}\n", flush=True)
+    
+    # ===========================================
+    # ETAPA 4: REORDENAR ROTAS QUE RECEBERAM REALOCAÇÕES
+    # ===========================================
+    if pedidos_realocados:
+        caminhoes_afetados = {pr.caminhao_realocado for pr in pedidos_realocados}
+        
+        print(f"\n{'='*50}", flush=True)
+        print(f"🔄 ETAPA 4: REORDENANDO ROTAS AFETADAS", flush=True)
+        print(f"{'='*50}", flush=True)
+        print(f"📦 Rotas a reotimizar: {len(caminhoes_afetados)} ({', '.join(sorted(caminhoes_afetados))})", flush=True)
+        
+        for truck_id in caminhoes_afetados:
+            rota_atual = novas_rotas.get(truck_id, [])
+            if len(rota_atual) >= 2:
+                print(f"\n   🚛 Caminhão {truck_id}: reordenando {len(rota_atual)} paradas...", flush=True)
+                print(f"      Ordem atual: {rota_atual}", flush=True)
+                
+                rota_otimizada = reordenar_rota_tsp(
+                    order_ids=rota_atual,
+                    order_coords=order_coords,
+                    depot_coords=depot_coords,
+                    osrm_url=osrm_url,
+                )
+                
+                novas_rotas[truck_id] = rota_otimizada
+                print(f"      Ordem otimizada: {rota_otimizada}", flush=True)
+            else:
+                print(f"\n   🚛 Caminhão {truck_id}: apenas {len(rota_atual)} parada(s), sem necessidade de reordenar", flush=True)
+        
+        print(f"\n{'='*50}", flush=True)
+        print(f"✅ REORDENAÇÃO CONCLUÍDA!", flush=True)
+        print(f"{'='*50}\n", flush=True)
     
     # Criar novo SolveResult
     novo_result = SolveResult(

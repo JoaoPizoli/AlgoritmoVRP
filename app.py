@@ -4,6 +4,7 @@ from services.geoloc_service import get_coordinates
 from services.processamento_dados import normalizar_dados_entrada, aplicar_regras_alocacao
 from services.osrm_service import criar_matriz_distancias
 from services.ortools import resolver_vrp_ortools, Truck, Order, plan_day_two_stage, PedidoRealocado
+import math
 
 app = Flask(__name__)
 
@@ -248,6 +249,130 @@ def get_geolocation():
             return jsonify({"erro": "Endereço não encontrado"}), 404
     except Exception as e:
         return jsonify({"erro": str(e)}), 500
+
+
+@app.route('/rotas/redespacho', methods=['POST'])
+def ordenar_redespacho():
+    """
+    Endpoint para ordenação de entregas por proximidade.
+    Recebe uma lista de pontos com código, latitude e longitude.
+    Retorna os códigos ordenados por proximidade, partindo de Mococa.
+    
+    Body esperado:
+    {
+        "pontos": [
+            {"codigo": "ID1", "latitude": -22.123, "longitude": -47.456},
+            {"codigo": "ID2", "latitude": -22.234, "longitude": -47.567},
+            ...
+        ]
+    }
+    """
+    data = request.get_json(silent=True)
+    
+    if not data:
+        return jsonify({"erro": "Body JSON é obrigatório"}), 400
+    
+    pontos = data.get('pontos')
+    if not isinstance(pontos, list) or not pontos:
+        return jsonify({"erro": "Campo 'pontos' deve ser uma lista não vazia"}), 400
+    
+    # Validar estrutura dos pontos
+    for i, ponto in enumerate(pontos):
+        if not isinstance(ponto, dict):
+            return jsonify({"erro": f"Ponto {i} deve ser um objeto"}), 400
+        if 'codigo' not in ponto:
+            return jsonify({"erro": f"Ponto {i} sem campo 'codigo'"}), 400
+        if 'latitude' not in ponto or 'longitude' not in ponto:
+            return jsonify({"erro": f"Ponto {i} (código: {ponto.get('codigo')}) sem 'latitude' ou 'longitude'"}), 400
+        
+        try:
+            float(ponto['latitude'])
+            float(ponto['longitude'])
+        except (ValueError, TypeError):
+            return jsonify({"erro": f"Coordenadas inválidas no ponto {ponto.get('codigo')}"}), 400
+    
+    try:
+        # Coordenadas de Mococa (ponto de partida/depósito)
+        from config.settings import DEPOSITO
+        mococa_lat = DEPOSITO['lat']
+        mococa_lng = DEPOSITO['lon']
+        
+        def calcular_distancia(lat1, lng1, lat2, lng2):
+            """Calcula distância euclidiana aproximada em km entre duas coordenadas."""
+            # Aproximação simples: 1 grau ≈ 111km
+            dlat = (lat2 - lat1) * 111.0
+            dlng = (lng2 - lng1) * 111.0 * math.cos(math.radians((lat1 + lat2) / 2))
+            return math.sqrt(dlat**2 + dlng**2)
+        
+        # Algoritmo Nearest Neighbor para ordenação
+        pontos_restantes = pontos.copy()
+        ordem_entrega = []
+        distancias_acumuladas = []
+        
+        # Posição atual começa em Mococa
+        lat_atual = mococa_lat
+        lng_atual = mococa_lng
+        distancia_total = 0.0
+        
+        print(f"\n{'='*60}", flush=True)
+        print(f"🚚 ORDENAÇÃO DE REDESPACHO - {len(pontos)} pontos", flush=True)
+        print(f"📍 Partindo de: Mococa (lat={mococa_lat}, lng={mococa_lng})", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        
+        # Enquanto houver pontos para visitar
+        while pontos_restantes:
+            # Encontrar o ponto mais próximo da posição atual
+            ponto_mais_proximo = None
+            menor_distancia = float('inf')
+            
+            for ponto in pontos_restantes:
+                lat = float(ponto['latitude'])
+                lng = float(ponto['longitude'])
+                distancia = calcular_distancia(lat_atual, lng_atual, lat, lng)
+                
+                if distancia < menor_distancia:
+                    menor_distancia = distancia
+                    ponto_mais_proximo = ponto
+            
+            # Adicionar o ponto mais próximo à ordem de entrega
+            ordem_entrega.append(ponto_mais_proximo['codigo'])
+            distancia_total += menor_distancia
+            distancias_acumuladas.append(round(distancia_total, 2))
+            
+            print(f"   {len(ordem_entrega)}. {ponto_mais_proximo['codigo']} (+{menor_distancia:.2f}km) - Total: {distancia_total:.2f}km", flush=True)
+            
+            # Atualizar posição atual
+            lat_atual = float(ponto_mais_proximo['latitude'])
+            lng_atual = float(ponto_mais_proximo['longitude'])
+            
+            # Remover ponto visitado
+            pontos_restantes.remove(ponto_mais_proximo)
+        
+        # Calcular distância de volta para Mococa (opcional, para informação)
+        distancia_retorno = calcular_distancia(lat_atual, lng_atual, mococa_lat, mococa_lng)
+        distancia_total_com_retorno = distancia_total + distancia_retorno
+        
+        print(f"\n{'='*60}", flush=True)
+        print(f"✅ Ordenação concluída!", flush=True)
+        print(f"📏 Distância total (sem retorno): {distancia_total:.2f}km", flush=True)
+        print(f"🔄 Distância de retorno a Mococa: {distancia_retorno:.2f}km", flush=True)
+        print(f"📐 Distância total (com retorno): {distancia_total_com_retorno:.2f}km", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        
+        return jsonify({
+            "sucesso": True,
+            "ordem_entrega": ordem_entrega,
+            "total_pontos": len(ordem_entrega),
+            "distancia_total_km": round(distancia_total, 2),
+            "distancia_retorno_km": round(distancia_retorno, 2),
+            "distancia_total_com_retorno_km": round(distancia_total_com_retorno, 2),
+            "distancias_acumuladas_km": distancias_acumuladas,
+            "ponto_partida": "Mococa"
+        }), 200
+        
+    except Exception as e:
+        print(f"[ERRO] Erro ao processar redespacho: {e}", flush=True)
+        return jsonify({"erro": "Erro interno ao processar ordenação", "detalhes": str(e)}), 500
 
 
 @app.route('/rotas', methods=['POST'])
