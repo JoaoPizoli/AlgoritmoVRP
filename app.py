@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from services.geoloc_service import get_coordinates
 
-from services.processamento_dados import normalizar_dados_entrada, aplicar_regras_alocacao
+from services.processamento_dados import normalizar_dados_entrada, aplicar_regras_alocacao, limpar_string_blindada
 from services.osrm_service import criar_matriz_distancias
 from services.ortools import resolver_vrp_ortools, Truck, Order, plan_day_two_stage, PedidoRealocado
 import math
@@ -18,6 +18,14 @@ def _as_str(v):
     if v is None:
         return ""
     return str(v)
+
+
+def _normalize_city(city_name):
+    """
+    Normaliza nome de cidade para comparação consistente.
+    Usa a mesma função da v1 para garantir consistência.
+    """
+    return limpar_string_blindada(city_name) if city_name else ""
 
 
 def _as_int(v, default=0):
@@ -52,7 +60,9 @@ def _parse_trucks(payload):
             raise ValueError(f"Truck '{tid}' com 'cities' inválido (esperado lista)")
 
         cap = _as_int(t.get('capacity_kg'), default=19000)
-        trucks.append(Truck(id=tid, cities=tuple(_as_str(c) for c in cities if _as_str(c)), capacity_kg=cap))
+        # Normaliza as cidades para garantir comparação consistente
+        normalized_cities = tuple(_normalize_city(c) for c in cities if _as_str(c))
+        trucks.append(Truck(id=tid, cities=normalized_cities, capacity_kg=cap))
 
     return trucks
 
@@ -68,7 +78,7 @@ def _parse_orders(payload):
             raise ValueError("Cada item de 'orders' deve ser um objeto")
 
         oid = _as_str(o.get('id'))
-        city = _as_str(o.get('city'))
+        city = _normalize_city(o.get('city'))  # Normaliza para comparação consistente
         if not oid:
             raise ValueError("Order sem 'id'")
 
