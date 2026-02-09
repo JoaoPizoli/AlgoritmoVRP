@@ -1,10 +1,9 @@
 from flask import Flask, request, jsonify
 from services.geoloc_service import get_coordinates
-
-from services.processamento_dados import normalizar_dados_entrada, aplicar_regras_alocacao, limpar_string_blindada
-from services.osrm_service import criar_matriz_distancias
-from services.ortools import resolver_vrp_ortools, Truck, Order, plan_day_two_stage, PedidoRealocado
+from services.processamento_dados import limpar_string_blindada
+from services.ortools import Truck, Order, plan_day_two_stage, PedidoRealocado
 import math
+import requests
 
 app = Flask(__name__)
 
@@ -40,6 +39,16 @@ def _as_float(v, default=0.0):
         return float(v)
     except Exception:
         return default
+
+
+def _validate_coord(lat, lng, label=""):
+    """Valida que lat está entre -90/90 e lng entre -180/180."""
+    if not (-90 <= lat <= 90):
+        raise ValueError(f"Latitude inválida ({lat}) {label}. Deve estar entre -90 e 90.")
+    if not (-180 <= lng <= 180):
+        raise ValueError(f"Longitude inválida ({lng}) {label}. Deve estar entre -180 e 180.")
+    if lat == 0.0 and lng == 0.0:
+        raise ValueError(f"Coordenadas zeradas (0,0) {label}. Verifique lat/lng.")
 
 
 def _parse_trucks(payload):
@@ -82,13 +91,17 @@ def _parse_orders(payload):
         if not oid:
             raise ValueError("Order sem 'id'")
 
+        ox = _as_float(o.get('x'), default=0.0)
+        oy = _as_float(o.get('y'), default=0.0)
+        _validate_coord(oy, ox, label=f"no pedido '{oid}'")
+
         orders.append(
             Order(
                 id=oid,
                 city=city,
                 weight_kg=_as_int(o.get('weight_kg'), default=0),
-                x=_as_float(o.get('x'), default=0.0),
-                y=_as_float(o.get('y'), default=0.0),
+                x=ox,
+                y=oy,
                 alt_truck_ids=[_as_str(tid) for tid in (o.get('alt_truck_ids') or []) if _as_str(tid)],
                 priority_penalty=_as_int(o.get('priority_penalty'), default=0),
             )
@@ -97,147 +110,58 @@ def _parse_orders(payload):
     return orders
 
 
-def _solve_payload_v2(payload):
-    from config.settings import (
-        OSRM_URL, 
-        MAX_KM_ADICIONAL_REALOCACAO, 
-        PRIORIDADE_MENOR_KM_ADICIONAL, 
-        PRIORIDADE_MAIS_PERTO
-    )
-    
-    depot = payload.get('depot')
-    if not isinstance(depot, dict):
-        raise ValueError("Campo 'depot' {x,y} é obrigatório")
+def _param_int(params, key):
+    """Retorna valor do param como int, ou None se não fornecido."""
+    val = params.get(key)
+    if val is None:
+        return None
+    try:
+        return int(round(float(val)))
+    except Exception:
+        return None
 
-    depot_xy = (_as_float(depot.get('x')), _as_float(depot.get('y')))
-    trucks = _parse_trucks(payload)
-    orders = _parse_orders(payload)
 
-    # Criar mapa de order_id -> coordenadas para cálculo de distância
-    order_coords = {o.id: (o.y, o.x) for o in orders}  # (lat, lng)
-    depot_coords = (_as_float(depot.get('y')), _as_float(depot.get('x')))  # (lat, lng)
+def _param_float(params, key):
+    """Retorna valor do param como float, ou None se não fornecido."""
+    val = params.get(key)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except Exception:
+        return None
 
-    params = payload.get('params') if isinstance(payload.get('params'), dict) else {}
-    res1, res2, pedidos_realocados = plan_day_two_stage(
-        orders=orders,
-        trucks=trucks,
-        depot_xy=depot_xy,
-        open_cost_step=_as_int(params.get('open_cost_step'), default=1_000_000),
-        stage1_drop_penalty=_as_int(params.get('stage1_drop_penalty'), default=50_000_000),
-        stage2_drop_penalty=_as_int(params.get('stage2_drop_penalty'), default=2_000_000),
-        stage2_move_penalty=_as_int(params.get('stage2_move_penalty'), default=200_000),
-        time_limit_seconds=_as_int(params.get('time_limit_seconds'), default=10),
-        # Novos parâmetros para realocação inteligente
-        max_km_adicional_realocacao=_as_float(params.get('max_km_adicional_realocacao'), default=MAX_KM_ADICIONAL_REALOCACAO),
-        prioridade_menor_km=PRIORIDADE_MENOR_KM_ADICIONAL,
-        prioridade_mais_perto=PRIORIDADE_MAIS_PERTO,
-        osrm_url=OSRM_URL,
-        order_coords=order_coords,
-        depot_coords=depot_coords,
-    )
 
-    def _calcular_distancia_rota_osrm(order_ids):
-        """Calcula distância total da rota via OSRM (CD -> paradas -> CD) em km"""
-        if not order_ids:
-            return 0.0
-        
-        # Montar sequência: depósito -> paradas -> depósito
-        coords = [depot_coords]
-        for oid in order_ids:
-            if oid in order_coords:
-                coords.append(order_coords[oid])
-        coords.append(depot_coords)  # Volta ao depósito
-        
-        if len(coords) < 2:
-            return 0.0
-        
-        # Formatar para OSRM: lng,lat
-        coords_str = ";".join([f"{lng},{lat}" for lat, lng in coords])
-        url = f"http://router.project-osrm.org/route/v1/driving/{coords_str}?overview=false"
-        
-        try:
-            import requests
-            from config.settings import OSRM_URL
-            # Tentar OSRM local primeiro (configuração do settings.py)
-            local_url = f"{OSRM_URL}/route/v1/driving/{coords_str}?overview=false"
-            try:
-                r = requests.get(local_url, timeout=10)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get('code') == 'Ok' and data.get('routes'):
-                        distance_m = data['routes'][0].get('distance', 0)
-                        return distance_m / 1000.0  # metros -> km
-            except Exception:
-                pass  # Fallback to public OSRM
-            
-            # Fallback: OSRM público
-            r = requests.get(url, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get('code') == 'Ok' and data.get('routes'):
-                    distance_m = data['routes'][0].get('distance', 0)
-                    return distance_m / 1000.0  # metros -> km
-        except Exception as e:
-            print(f"[WARN] Erro ao consultar OSRM para distância: {e}", flush=True)
-        
+def _calcular_distancia_rota_osrm(order_ids, order_coords, depot_coords):
+    """Calcula distância total da rota via OSRM (CD -> paradas -> CD) em km."""
+    if not order_ids:
         return 0.0
 
-    def pack_result(res):
-        # Calcular distância de cada rota
-        distances_by_truck = {}
-        for truck_id, order_ids in res.routes.items():
-            if order_ids:
-                distances_by_truck[truck_id] = _calcular_distancia_rota_osrm(order_ids)
-            else:
-                distances_by_truck[truck_id] = 0.0
-        
-        return {
-            'objective': int(res.objective),
-            'dropped_orders': list(res.dropped_orders),
-            'served_by_truck': dict(res.served_by_truck),
-            'routes': dict(res.routes),
-            'loads_by_truck': dict(res.loads_by_truck),
-            'distances_by_truck_km': distances_by_truck,  # NOVO: distâncias em km
-        }
+    from config.settings import OSRM_URL
 
-    # Log de caminhões utilizados e não utilizados
-    trucks_usados = [tid for tid, orders in res2.routes.items() if orders]
-    trucks_nao_usados = [tid for tid, orders in res2.routes.items() if not orders]
-    
-    print(f"\n{'='*50}", flush=True)
-    print(f"📊 RESUMO DE CAMINHÕES", flush=True)
-    print(f"{'='*50}", flush=True)
-    print(f"✅ Utilizados ({len(trucks_usados)}): {', '.join(sorted(trucks_usados, key=lambda x: int(x) if x.isdigit() else x))}", flush=True)
-    if trucks_nao_usados:
-        print(f"⏸️  Não utilizados ({len(trucks_nao_usados)}): {', '.join(sorted(trucks_nao_usados, key=lambda x: int(x) if x.isdigit() else x))}", flush=True)
-    print(f"{'='*50}\n", flush=True)
+    coords = [depot_coords]
+    for oid in order_ids:
+        if oid in order_coords:
+            coords.append(order_coords[oid])
+    coords.append(depot_coords)
 
-    # Formatar pedidos_realocados para o retorno JSON
-    pedidos_realocados_json = [
-        {
-            'id': pr.id,
-            'cidade': pr.cidade,
-            'caminhao_original': pr.caminhao_original,
-            'caminhao_realocado': pr.caminhao_realocado,
-            'distancia_adicional_km': pr.distancia_adicional_km,
-            'peso_kg': pr.peso_kg,
-            'motivo': pr.motivo,
-        }
-        for pr in pedidos_realocados
-    ]
-    
-    if pedidos_realocados:
-        print(f"\n{'='*50}", flush=True)
-        print(f"🔄 PEDIDOS REALOCADOS: {len(pedidos_realocados)}", flush=True)
-        for pr in pedidos_realocados:
-            print(f"   📦 {pr.id} ({pr.cidade}): Caminhão {pr.caminhao_original} → {pr.caminhao_realocado} (+{pr.distancia_adicional_km}km)", flush=True)
-        print(f"{'='*50}\n", flush=True)
+    if len(coords) < 3:
+        return 0.0
 
-    return {
-        'stage1': pack_result(res1), 
-        'stage2': pack_result(res2),
-        'pedidos_realocados': pedidos_realocados_json,
-    }
+    coords_str = ";".join([f"{lng},{lat}" for lat, lng in coords])
+
+    try:
+        url = f"{OSRM_URL}/route/v1/driving/{coords_str}?overview=false"
+        r = requests.get(url, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get('code') == 'Ok' and data.get('routes'):
+                return data['routes'][0].get('distance', 0) / 1000.0
+    except Exception as e:
+        print(f"[WARN] Erro ao consultar OSRM para distância: {e}", flush=True)
+
+    return 0.0
+
 
 @app.route('/geoloc', methods=['POST'])
 def get_geolocation():
@@ -382,70 +306,111 @@ def ordenar_redespacho():
 @app.route('/rotas', methods=['POST'])
 def calcular_rotas():
     """
-    Endpoint principal que orquestra:
-    1. Normalização dos dados
-    2. Cálculo de Matriz (OSRM)
-    3. Lógica de Negócio (Baldes/Caminhões)
-    4. Otimização Matemática (OR-Tools)
+    Endpoint principal de roteirização.
+
+    Input:
+    {
+        "orders": [{"id", "city", "weight_kg", "x", "y", "alt_truck_ids?", "priority_penalty?"}],
+        "trucks": [{"id", "cities": [], "capacity_kg?"}],
+        "depot": {"x", "y"},
+        "params": { overrides opcionais do settings.py }
+    }
     """
     data = request.get_json(silent=True)
-    
+
     if not data:
         return jsonify({"erro": "Body JSON é obrigatório"}), 400
 
-    # Suporta 2 formatos:
-    # (v1 legado) { pedidos:[{lat,lng,peso,cidade}], deposito:{lat,lng}, num_caminhoes:int, preferencias_caminhoes?:{} }
-    # (v2)        { orders:[...], trucks:[...], depot:{x,y}, params?:{} }
-    is_v2 = isinstance(data.get('orders'), list) and isinstance(data.get('trucks'), list) and isinstance(data.get('depot'), dict)
-
-    if not is_v2:
-        # Verifica se os campos cruciais existem (v1)
-        if 'pedidos' not in data or not isinstance(data['pedidos'], list):
-            return jsonify({"erro": "Campo 'pedidos' é obrigatório."}), 400
-
-        # IMPORTANTE: O algoritmo precisa saber onde começa (Depósito).
-        if 'deposito' not in data:
-            return jsonify({"erro": "Campo 'deposito' {lat, lng} é obrigatório para calcular a rota."}), 400
-
-        if 'num_caminhoes' not in data:
-            return jsonify({"erro": "Campo 'num_caminhoes' é obrigatório."}), 400
-
+    if not isinstance(data.get('orders'), list):
+        return jsonify({"erro": "Campo 'orders' é obrigatório (lista)."}), 400
+    if not isinstance(data.get('trucks'), list):
+        return jsonify({"erro": "Campo 'trucks' é obrigatório (lista)."}), 400
+    if not isinstance(data.get('depot'), dict):
+        return jsonify({"erro": "Campo 'depot' {x,y} é obrigatório."}), 400
 
     try:
-        if is_v2:
-            print("[VRP v2] Resolvendo com payload orders/trucks...", flush=True)
-            resultado_final = _solve_payload_v2(data)
-            return jsonify(resultado_final), 200
+        depot = data['depot']
+        depot_xy = (_as_float(depot.get('x')), _as_float(depot.get('y')))
+        depot_coords = (_as_float(depot.get('y')), _as_float(depot.get('x')))  # (lat, lng)
+        _validate_coord(depot_coords[0], depot_coords[1], label="no depot")
 
-        # --- FLUXO LEGADO (v1) ---
-        # --- ETAPA 1: PREPARAÇÃO DOS DADOS ---
-        print("[1/4] Normalizando dados...", flush=True)
-        dados_norm = normalizar_dados_entrada(data)
+        trucks = _parse_trucks(data)
+        orders = _parse_orders(data)
+        order_coords = {o.id: (o.y, o.x) for o in orders}  # (lat, lng)
 
-        # --- ETAPA 2: MATRIZ DE DISTÂNCIAS (OSRM) ---
-        print("[2/4] Consultando OSRM...", flush=True)
-        matriz_distancias = criar_matriz_distancias(dados_norm['lista_osrm'])
+        params = data.get('params') if isinstance(data.get('params'), dict) else {}
 
-        if not matriz_distancias:
-            return jsonify({"erro": "Falha de comunicação com o serviço de rotas (OSRM)."}), 503
+        print("[VRP] Resolvendo roteirização...", flush=True)
+        res1, res2, pedidos_realocados = plan_day_two_stage(
+            orders=orders,
+            trucks=trucks,
+            depot_xy=depot_xy,
+            depot_coords=depot_coords,
+            order_coords=order_coords,
+            open_cost_step=_param_int(params, 'open_cost_step'),
+            stage1_drop_penalty=_param_int(params, 'stage1_drop_penalty'),
+            stage2_drop_penalty=_param_int(params, 'stage2_drop_penalty'),
+            stage2_move_penalty=_param_int(params, 'stage2_move_penalty'),
+            time_limit_seconds=_param_int(params, 'time_limit_seconds'),
+            max_km_adicional_realocacao=_param_float(params, 'max_km_adicional_realocacao'),
+        )
 
-        # --- ETAPA 3: LÓGICA DE NEGÓCIO (OS BALDES) ---
-        print("[3/4] Aplicando regras de alocacao e prioridade...", flush=True)
-        logica_negocio = aplicar_regras_alocacao(dados_norm)
+        # Monta resultado no formato de saída
+        def pack_result(res):
+            distances_by_truck = {}
+            for truck_id, oids in res.routes.items():
+                distances_by_truck[truck_id] = (
+                    _calcular_distancia_rota_osrm(oids, order_coords, depot_coords) if oids else 0.0
+                )
+            return {
+                'objective': int(res.objective),
+                'dropped_orders': list(res.dropped_orders),
+                'served_by_truck': dict(res.served_by_truck),
+                'routes': dict(res.routes),
+                'loads_by_truck': dict(res.loads_by_truck),
+                'distances_by_truck_km': distances_by_truck,
+            }
 
-        print(f"   -> Fixos: {len(logica_negocio['pre_alocacoes'])} | Excedentes: {len(logica_negocio['excedentes'])}", flush=True)
+        # Log de caminhões
+        trucks_usados = [tid for tid, oids in res2.routes.items() if oids]
+        trucks_nao_usados = [tid for tid, oids in res2.routes.items() if not oids]
 
-        # --- ETAPA 4: SOLVER (OR-TOOLS) ---
-        print("[4/4] Otimizando rotas com OR-Tools...", flush=True)
-        resultado_final = resolver_vrp_ortools(dados_norm, logica_negocio, matriz_distancias)
+        print(f"\n{'='*50}", flush=True)
+        print(f"RESUMO DE CAMINHOES", flush=True)
+        print(f"{'='*50}", flush=True)
+        print(f"Utilizados ({len(trucks_usados)}): {', '.join(sorted(trucks_usados, key=lambda x: int(x) if x.isdigit() else x))}", flush=True)
+        if trucks_nao_usados:
+            print(f"Nao utilizados ({len(trucks_nao_usados)}): {', '.join(sorted(trucks_nao_usados, key=lambda x: int(x) if x.isdigit() else x))}", flush=True)
+        print(f"{'='*50}\n", flush=True)
 
-        if not resultado_final:
-            return jsonify({"atencao": "O algoritmo rodou mas não encontrou uma solução viável (verifique restrições)."}), 422
+        # Formatar realocações
+        pedidos_realocados_json = [
+            {
+                'id': pr.id,
+                'cidade': pr.cidade,
+                'caminhao_original': pr.caminhao_original,
+                'caminhao_realocado': pr.caminhao_realocado,
+                'distancia_adicional_km': pr.distancia_adicional_km,
+                'peso_kg': pr.peso_kg,
+                'motivo': pr.motivo,
+            }
+            for pr in pedidos_realocados
+        ]
 
-        return jsonify(resultado_final), 200
+        if pedidos_realocados:
+            print(f"\n{'='*50}", flush=True)
+            print(f"PEDIDOS REALOCADOS: {len(pedidos_realocados)}", flush=True)
+            for pr in pedidos_realocados:
+                print(f"   {pr.id} ({pr.cidade}): Caminhao {pr.caminhao_original} -> {pr.caminhao_realocado} (+{pr.distancia_adicional_km}km)", flush=True)
+            print(f"{'='*50}\n", flush=True)
+
+        return jsonify({
+            'stage1': pack_result(res1),
+            'stage2': pack_result(res2),
+            'pedidos_realocados': pedidos_realocados_json,
+        }), 200
 
     except ValueError as e:
-        # Erros de validação/regra de negócio (ex.: cidade fora das rotas do dia)
         print(f"[VALIDACAO] {e}")
         return jsonify({"erro": "Dados inválidos para roteirização.", "detalhes": str(e)}), 422
     except Exception as e:

@@ -58,6 +58,19 @@ def _consultar_osrm_tabela(lista_clientes, sources=None, destinations=None):
         return None
 
 
+def _calcular_fallback_distancia(lista_clientes, i, j):
+    """
+    Calcula distância euclidiana aproximada (em metros) entre dois pontos
+    para usar como fallback quando o OSRM retorna None.
+    """
+    import math
+    lat1, lon1 = float(lista_clientes[i]['lat']), float(lista_clientes[i]['lon'])
+    lat2, lon2 = float(lista_clientes[j]['lat']), float(lista_clientes[j]['lon'])
+    dlat = (lat2 - lat1) * 111_320
+    dlng = (lon2 - lon1) * 111_320 * math.cos(math.radians((lat1 + lat2) / 2))
+    return int(math.sqrt(dlat**2 + dlng**2) * 1.4)  # Fator 1.4 para compensar ruas não retas
+
+
 def criar_matriz_distancias(lista_clientes):
     """
     Consulta o OSRM para calcular a matriz de distâncias entre todos os pontos.
@@ -79,8 +92,13 @@ def criar_matriz_distancias(lista_clientes):
             return None
         
         matriz_final = []
-        for linha in dados['distances']:
-            linha_int = [int(val) if val is not None else 10_000_000 for val in linha]
+        for i, linha in enumerate(dados['distances']):
+            linha_int = []
+            for j, val in enumerate(linha):
+                if val is not None:
+                    linha_int.append(int(val))
+                else:
+                    linha_int.append(_calcular_fallback_distancia(lista_clientes, i, j))
             matriz_final.append(linha_int)
         
         print(f"[OK] Matriz calculada via OSRM ({n}x{n})")
@@ -89,8 +107,8 @@ def criar_matriz_distancias(lista_clientes):
     # Se muitos pontos, divide em lotes
     print(f"[OSRM] Dividindo em lotes (limite: {MAX_PONTOS_POR_REQUISICAO} pontos por requisicao)...")
     
-    # Inicializa matriz NxN vazia
-    matriz_final = [[10_000_000 for _ in range(n)] for _ in range(n)]
+    # Inicializa matriz NxN vazia (será preenchida com dados reais)
+    matriz_final = [[0 for _ in range(n)] for _ in range(n)]
     
     # Calcula quantos lotes precisamos
     num_lotes = (n + MAX_PONTOS_POR_REQUISICAO - 1) // MAX_PONTOS_POR_REQUISICAO
@@ -126,7 +144,10 @@ def criar_matriz_distancias(lista_clientes):
             for idx_i, i in enumerate(indices_origem):
                 for idx_j, j in enumerate(indices_destino):
                     val = dados['distances'][idx_i][idx_j]
-                    matriz_final[i][j] = int(val) if val is not None else 10_000_000
+                    if val is not None:
+                        matriz_final[i][j] = int(val)
+                    else:
+                        matriz_final[i][j] = _calcular_fallback_distancia(lista_clientes, i, j)
     
     print(f"[OK] Matriz completa via OSRM ({n}x{n})")
     return matriz_final

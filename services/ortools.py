@@ -232,10 +232,20 @@ def solve_vrp(
         penalty = drop_penalty_per_order[o.id]
         routing.AddDisjunction([idx], penalty)
 
-    # (E) Busca
+    # (E) Busca (estratégias configuráveis via settings.py)
+    from config.settings import FIRST_SOLUTION_STRATEGY, METODO_BUSCA_LOCAL
+
     params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
+    params.first_solution_strategy = getattr(
+        routing_enums_pb2.FirstSolutionStrategy,
+        FIRST_SOLUTION_STRATEGY,
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC,
+    )
+    params.local_search_metaheuristic = getattr(
+        routing_enums_pb2.LocalSearchMetaheuristic,
+        METODO_BUSCA_LOCAL,
+        routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH,
+    )
     params.time_limit.FromSeconds(time_limit_seconds)
 
     solution = routing.SolveWithParameters(params)
@@ -295,10 +305,25 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return default
 
 
-def _normalize_square_matrix_to_int(matrix: List[List[Any]], fallback: int = 10_000_000) -> List[List[int]]:
+def _normalize_square_matrix_to_int(matrix: List[List[Any]]) -> List[List[int]]:
+    """Converte matriz para inteiros. Valores None recebem fallback baseado no max real da matriz."""
     if not matrix:
         return []
     n = len(matrix)
+
+    # Primeiro passo: encontrar o maior valor real da matriz para calcular fallback
+    max_real = 0
+    for row in matrix:
+        for v in row:
+            if v is not None:
+                try:
+                    val = int(round(float(v)))
+                    if val > max_real:
+                        max_real = val
+                except Exception:
+                    pass
+    fallback = max(max_real * 3, 1_000_000)  # 3x o máximo real, mínimo 1M
+
     out: List[List[int]] = []
     for i in range(n):
         row = matrix[i]
@@ -314,215 +339,32 @@ def _normalize_square_matrix_to_int(matrix: List[List[Any]], fallback: int = 10_
     return out
 
 
-def resolver_vrp_ortools(dados_normalizados: Dict[str, Any], logica_negocio: Dict[str, Any], matriz_distancias: List[List[Any]]):
-    """Wrapper compatível com o fluxo do [app.py](app.py).
+# =========================
+# 5) CONSTRUÇÃO DA MATRIZ DE CUSTO VIA OSRM
+# =========================
 
-    Espera:
-      - dados_normalizados: retorno de normalizar_dados_entrada()
-      - logica_negocio: retorno de aplicar_regras_alocacao()
-      - matriz_distancias: matriz NxN (OSRM) em metros
-
-    Retorna:
-      Dict JSON-friendly com chaves: rotas, excedentes
+def _build_osrm_cost_matrix(
+    orders: List[Order],
+    depot_coords: Tuple[float, float],
+    order_coords: Dict[str, Tuple[float, float]],
+) -> Optional[List[List[int]]]:
     """
-    from config.settings import CAPACIDADE_VEICULO_KG, PENALIDADE_DE_DROP, TEMPO_LIMITE_SOLVER_SEGUNDOS
+    Constrói matriz de custo NxN via OSRM (índice 0 = depósito, 1..N = pedidos).
+    Usa distâncias reais de estrada em metros.
+    Retorna None se a consulta OSRM falhar.
+    """
+    from services.osrm_service import criar_matriz_distancias
 
-    num_caminhoes = int(dados_normalizados.get('num_caminhoes') or 0)
-    if num_caminhoes <= 0:
-        raise ValueError("num_caminhoes precisa ser > 0")
-
-    prefs = dados_normalizados.get('prefs') or {}
-
-    # Monta caminhões (ids = "0", "1", ... para casar com o resto do projeto)
-    trucks: List[Truck] = []
-    for i in range(num_caminhoes):
-        cfg = prefs.get(str(i), {})
-        cities = tuple(cfg.get('cidades') or ())
-        trucks.append(Truck(id=str(i), cities=cities, capacity_kg=int(CAPACIDADE_VEICULO_KG)))
-
-    # Clientes (0 = depósito) no formato usado pelos formatters/map_service
-    lista_osrm = dados_normalizados.get('lista_osrm') or []
-    if not lista_osrm:
-        raise ValueError("dados_normalizados['lista_osrm'] vazio")
-
-    depot_point = lista_osrm[0]
-    clientes: List[Dict[str, Any]] = [
-        {
-            'id': 'DEPÓSITO',
-            'lat': float(depot_point.get('lat')),
-            'lon': float(depot_point.get('lon')),
-            'peso': 0,
-            'cidade': 'DEPÓSITO',
-        }
-    ]
-
-    pedidos_metadata = dados_normalizados.get('pedidos_metadata') or []
-    for meta in pedidos_metadata:
-        p = meta.get('original_data') or {}
-        clientes.append(
-            {
-                'id': p.get('id') or f"{meta.get('cidade_original', meta.get('cidade', 'PEDIDO'))} #{meta.get('or_tools_index')}",
-                'lat': float(p.get('lat')),
-                'lon': float(p.get('lng')),
-                'peso': _safe_int(meta.get('peso'), default=0),
-                'cidade': meta.get('cidade_original') or meta.get('cidade') or 'DESCONHECIDA',
-                'cidade_limpa': meta.get('cidade') or '',
-            }
-        )
-
-    # Converte OSRM -> int
-    cost_matrix = _normalize_square_matrix_to_int(matriz_distancias)
-
-    # Monta pedidos para o solver (ids = node_index como string)
-    orders: List[Order] = []
-    for meta in pedidos_metadata:
-        node_index = int(meta['or_tools_index'])
-        point = lista_osrm[node_index]
-        orders.append(
-            Order(
-                id=str(node_index),
-                city=str(meta.get('cidade') or ''),
-                weight_kg=_safe_int(meta.get('peso'), default=0),
-                x=float(point.get('lon')),
-                y=float(point.get('lat')),
-            )
-        )
-
-    # Base por cidade: caminhões que "aceitam" a cidade.
-    # Regra prática para compatibilidade: caminhão sem cidades configuradas vira "coringa" (aceita qualquer cidade).
-    all_truck_ids = [t.id for t in trucks]
-    city_to_base: Dict[str, List[str]] = {}
+    pontos = [{'lat': depot_coords[0], 'lon': depot_coords[1]}]
     for o in orders:
-        if o.city in city_to_base:
-            continue
-        base = [t.id for t in trucks if (not t.cities) or (o.city in t.cities)]
-        city_to_base[o.city] = base if base else all_truck_ids[:]
+        coord = order_coords.get(o.id, (o.y, o.x))
+        pontos.append({'lat': coord[0], 'lon': coord[1]})
 
-    # Travar pre-alocações da etapa 3 (baldes): índice do nó -> caminhão
-    pre_aloc = logica_negocio.get('pre_alocacoes') or {}
-
-    # ---------- ETAPA 1: identifica excedentes por capacidade ----------
-    allowed_1: Dict[str, List[str]] = {}
-    drop_1: Dict[str, int] = {}
-    base_trucks_per_order: Dict[str, Set[str]] = {}
-
-    for o in orders:
-        fixed_truck = pre_aloc.get(int(o.id))
-        if fixed_truck is not None:
-            allowed = [str(fixed_truck)]
-        else:
-            allowed = city_to_base.get(o.city, all_truck_ids)
-
-        allowed_1[o.id] = allowed
-        base_trucks_per_order[o.id] = set(allowed)
-        drop_1[o.id] = int(PENALIDADE_DE_DROP)
-
-    res1 = solve_vrp(
-        orders=orders,
-        trucks=trucks,
-        depot_xy=(0.0, 0.0),
-        cost_matrix=cost_matrix,
-        allowed_trucks_per_order=allowed_1,
-        drop_penalty_per_order=drop_1,
-        vehicle_fixed_costs=None,
-        base_trucks_per_order=None,
-        move_penalty_if_outside_base=0,
-        time_limit_seconds=int(TEMPO_LIMITE_SOLVER_SEGUNDOS),
-    )
-
-    excess_set = set(res1.dropped_orders)
-
-    # ---------- ETAPA 2: só excedente pode circular ----------
-    allowed_2: Dict[str, List[str]] = {}
-    drop_2: Dict[str, int] = {}
-
-    for o in orders:
-        base = list(base_trucks_per_order[o.id])
-        if o.id in excess_set:
-            allowed_2[o.id] = all_truck_ids[:]  # excedente pode ir para qualquer caminhão
-            drop_2[o.id] = int(PENALIDADE_DE_DROP)
-        else:
-            allowed_2[o.id] = base
-            drop_2[o.id] = int(PENALIDADE_DE_DROP)
-
-    res2 = solve_vrp(
-        orders=orders,
-        trucks=trucks,
-        depot_xy=(0.0, 0.0),
-        cost_matrix=cost_matrix,
-        allowed_trucks_per_order=allowed_2,
-        drop_penalty_per_order=drop_2,
-        vehicle_fixed_costs=None,
-        base_trucks_per_order=base_trucks_per_order,
-        move_penalty_if_outside_base=200_000,
-        time_limit_seconds=int(TEMPO_LIMITE_SOLVER_SEGUNDOS),
-    )
-
-    # ---------- Formata saída compatível ----------
-    def estimate_minutes_from_meters(m: int) -> int:
-        # Aproximação simples: 60 km/h ~ 1000 m/min.
-        return int(round(m / 1000))
-
-    rotas_out: List[Dict[str, Any]] = []
-    for truck in trucks:
-        truck_id = truck.id
-        seq_orders = res2.routes.get(truck_id) or []
-        if not seq_orders:
-            continue
-
-        nodes = [0] + [int(oid) for oid in seq_orders]
-        distancia = 0
-        carga = 0
-        tempo = 0
-        paradas: List[Dict[str, Any]] = [
-            {
-                'node_index': 0,
-                'cliente': clientes[0],
-                'carga_acumulada': 0,
-                'distancia_acumulada': 0,
-                'tempo_acumulado': 0,
-            }
-        ]
-
-        prev = 0
-        for node in nodes[1:]:
-            step = int(cost_matrix[prev][node])
-            distancia += step
-            tempo += estimate_minutes_from_meters(step)
-            carga += _safe_int(clientes[node].get('peso'), default=0)
-            paradas.append(
-                {
-                    'node_index': node,
-                    'cliente': clientes[node],
-                    'carga_acumulada': carga,
-                    'distancia_acumulada': distancia,
-                    'tempo_acumulado': tempo,
-                }
-            )
-            prev = node
-
-        distancia_total = distancia + int(cost_matrix[prev][0])
-        rotas_out.append(
-            {
-                'veiculo_id': int(truck_id) + 1 if str(truck_id).isdigit() else truck_id,
-                'paradas': paradas,
-                'distancia_total': distancia_total,
-                'carga_total': carga,
-            }
-        )
-
-    excedentes_out = [clientes[int(oid)] for oid in res2.dropped_orders]
-
-    return {
-        'rotas': rotas_out,
-        'excedentes': excedentes_out,
-        'objective': res2.objective,
-        'excedentes_etapa1': [clientes[int(oid)] for oid in res1.dropped_orders],
-    }
+    return criar_matriz_distancias(pontos)
 
 
 # =========================
-# 5) REALOCAÇÃO DE EXCEDENTES (ETAPA 2 INTELIGENTE)
+# 6) REALOCAÇÃO DE EXCEDENTES (ETAPA 2 INTELIGENTE)
 # =========================
 
 def _calcular_distancia_rota_osrm_coords(coords_list: List[Tuple[float, float]], osrm_url: str) -> float:
@@ -609,8 +451,14 @@ def reordenar_rota_tsp(
         if r.status_code == 200:
             data = r.json()
             if data.get('code') == 'Ok' and data.get('distances'):
-                cost_matrix = [[int(d) if d is not None else 10_000_000 for d in row] 
-                               for row in data['distances']]
+                cost_matrix = []
+                for row in data['distances']:
+                    cost_matrix.append([int(d) if d is not None else int(_calcular_distancia_euclidiana(coords_list[0], coords_list[0]) * 1000) for d in row])
+                # Corrigir Nones com euclidiana real por par
+                for ri, row in enumerate(data['distances']):
+                    for ci, d in enumerate(row):
+                        if d is None:
+                            cost_matrix[ri][ci] = int(_calcular_distancia_euclidiana(coords_list[ri], coords_list[ci]) * 1000 * 1.4)
             else:
                 # Fallback para distância euclidiana
                 cost_matrix = _build_euclidean_matrix(coords_list)
@@ -634,9 +482,10 @@ def reordenar_rota_tsp(
     
     # Parâmetros de busca
     search_params = pywrapcp.DefaultRoutingSearchParameters()
+    from config.settings import TSP_TIME_LIMIT_SECONDS
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
     search_params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    search_params.time_limit.FromSeconds(5)  # Limite curto pois é só 1 rota
+    search_params.time_limit.FromSeconds(TSP_TIME_LIMIT_SECONDS)
     
     solution = routing.SolveWithParameters(search_params)
     
@@ -683,199 +532,205 @@ def realocar_excedentes_inteligente(
     osrm_url: str = "http://router.project-osrm.org",
 ) -> Tuple[SolveResult, List[PedidoRealocado]]:
     """
-    Analisa os excedentes da etapa 1 e tenta realocá-los em caminhões com espaço disponível,
+    Analisa os excedentes e tenta realocá-los em caminhões com espaço disponível,
     desde que o aumento de km seja aceitável.
-    
+
+    Avalia TODOS os pares (excedente, caminhão) de uma vez e aloca sempre o melhor
+    par disponível (menor km adicional ou mais próximo), evitando a­simple greedy
+    sequencial que pode desperdiçar espaço.
+
     Retorna:
         - SolveResult atualizado com as rotas reotimizadas
         - Lista de PedidoRealocado com info dos pedidos movidos
     """
     from config.settings import CAPACIDADE_VEICULO_KG
-    
+
     excedentes = res_etapa1.dropped_orders[:]
     if not excedentes:
-        print("[REALOCAÇÃO] Nenhum excedente para realocar.", flush=True)
+        print("[REALOCACAO] Nenhum excedente para realocar.", flush=True)
         return res_etapa1, []
-    
+
     print(f"\n{'='*50}", flush=True)
-    print(f"🔄 ETAPA 2: REALOCAÇÃO INTELIGENTE DE EXCEDENTES", flush=True)
+    print(f"[REALOCACAO] ETAPA: REALOCACAO INTELIGENTE DE EXCEDENTES", flush=True)
     print(f"{'='*50}", flush=True)
-    print(f"📦 Excedentes a analisar: {len(excedentes)}", flush=True)
-    print(f"⚙️  Max KM adicional permitido: {max_km_adicional}km", flush=True)
-    
-    # Mapear orders por id
+    print(f"Excedentes a analisar: {len(excedentes)}", flush=True)
+    print(f"Max KM adicional permitido: {max_km_adicional}km", flush=True)
+
     orders_by_id = {o.id: o for o in orders}
-    trucks_by_id = {t.id: t for t in trucks}
-    
+    city_to_trucks = city_to_base_trucks(trucks)
+
     # Copiar rotas e cargas para modificação
-    novas_rotas = {tid: list(orders) for tid, orders in res_etapa1.routes.items()}
+    novas_rotas = {tid: list(oids) for tid, oids in res_etapa1.routes.items()}
     novas_cargas = dict(res_etapa1.loads_by_truck)
     novo_served = dict(res_etapa1.served_by_truck)
-    
-    pedidos_realocados: List[PedidoRealocado] = []
-    excedentes_finais: List[str] = []
-    
-    # Identificar o caminhão original de cada excedente (qual rota era a "dona" da cidade)
-    city_to_trucks = city_to_base_trucks(trucks)
-    
-    for exc_id in excedentes:
-        order = orders_by_id.get(exc_id)
-        if not order:
-            excedentes_finais.append(exc_id)
+
+    # ---------------------------------------------------------------
+    # Pré-calcular distância atual de cada caminhão (só uma vez)
+    # ---------------------------------------------------------------
+    dist_atual_cache: Dict[str, float] = {}
+    for truck in trucks:
+        rota = novas_rotas.get(truck.id, [])
+        if not rota:
+            dist_atual_cache[truck.id] = 0.0
             continue
-        
-        exc_coords = order_coords.get(exc_id, (order.y, order.x))  # (lat, lng)
-        caminhao_original = city_to_trucks.get(order.city, ["?"])[0]  # Primeiro caminhão da rota base
-        
-        print(f"\n📍 Analisando excedente: {exc_id} (cidade: {order.city}, peso: {order.weight_kg}kg)", flush=True)
-        print(f"   Rota original: Caminhão {caminhao_original}", flush=True)
-        
-        # Avaliar todos os caminhões que têm espaço
-        candidatos = []
-        
-        for truck in trucks:
-            # Pular o caminhão da própria rota base (já sabemos que não coube)
-            if truck.id in city_to_trucks.get(order.city, []):
+        coords = [depot_coords]
+        for oid in rota:
+            if oid in order_coords:
+                coords.append(order_coords[oid])
+        coords.append(depot_coords)
+        d = _calcular_distancia_rota_osrm_coords(coords, osrm_url)
+        if d < 0:
+            d = sum(_calcular_distancia_euclidiana(coords[i], coords[i + 1])
+                    for i in range(len(coords) - 1))
+        dist_atual_cache[truck.id] = d
+
+    # ---------------------------------------------------------------
+    # Avaliar TODOS os pares (excedente, caminhão) de uma vez
+    # ---------------------------------------------------------------
+    excedentes_restantes = set(excedentes)
+    pedidos_realocados: List[PedidoRealocado] = []
+
+    while excedentes_restantes:
+        melhor_par = None  # (exc_id, truck_id, km_adicional, dist_direta)
+
+        for exc_id in list(excedentes_restantes):
+            order = orders_by_id.get(exc_id)
+            if not order:
+                excedentes_restantes.discard(exc_id)
                 continue
-            
-            # Verificar se tem capacidade
-            carga_atual = novas_cargas.get(truck.id, 0)
-            capacidade = truck.capacity_kg or CAPACIDADE_VEICULO_KG
-            espaco_disponivel = capacidade - carga_atual
-            
-            if espaco_disponivel < order.weight_kg:
-                print(f"   ❌ Caminhão {truck.id}: sem espaço ({espaco_disponivel}kg disponível, precisa {order.weight_kg}kg)", flush=True)
-                continue
-            
-            # Calcular distância atual da rota do caminhão
-            rota_atual = novas_rotas.get(truck.id, [])
-            
-            # Montar sequência de coordenadas: depósito -> paradas -> depósito
-            coords_atual = [depot_coords]
-            for oid in rota_atual:
-                if oid in order_coords:
-                    coords_atual.append(order_coords[oid])
-            coords_atual.append(depot_coords)
-            
-            dist_atual_km = _calcular_distancia_rota_osrm_coords(coords_atual, osrm_url)
-            if dist_atual_km < 0:
-                # Fallback para euclidiana se OSRM falhar
-                dist_atual_km = sum(_calcular_distancia_euclidiana(coords_atual[i], coords_atual[i+1]) 
-                                   for i in range(len(coords_atual)-1))
-            
-            # Simular adição do excedente no final da rota (depois será reotimizado)
-            coords_com_exc = [depot_coords]
-            for oid in rota_atual:
-                if oid in order_coords:
-                    coords_com_exc.append(order_coords[oid])
-            coords_com_exc.append(exc_coords)
-            coords_com_exc.append(depot_coords)
-            
-            dist_com_exc_km = _calcular_distancia_rota_osrm_coords(coords_com_exc, osrm_url)
-            if dist_com_exc_km < 0:
-                dist_com_exc_km = sum(_calcular_distancia_euclidiana(coords_com_exc[i], coords_com_exc[i+1]) 
-                                     for i in range(len(coords_com_exc)-1))
-            
-            km_adicional = dist_com_exc_km - dist_atual_km
-            
-            # Calcular distância direta do depósito/rota ao excedente (para critério "mais perto")
-            dist_direta = _calcular_distancia_euclidiana(depot_coords, exc_coords)
-            if rota_atual:
-                # Distância do último ponto da rota ao excedente
-                ultimo_ponto = order_coords.get(rota_atual[-1], depot_coords)
-                dist_direta = min(dist_direta, _calcular_distancia_euclidiana(ultimo_ponto, exc_coords))
-            
-            print(f"   🚛 Caminhão {truck.id}: rota atual={dist_atual_km:.1f}km, com exc={dist_com_exc_km:.1f}km, adicional={km_adicional:.1f}km", flush=True)
-            
-            if km_adicional <= max_km_adicional:
-                candidatos.append({
-                    'truck_id': truck.id,
-                    'km_adicional': km_adicional,
-                    'dist_direta': dist_direta,
-                    'dist_com_exc': dist_com_exc_km,
-                })
-                print(f"      ✅ VIÁVEL! (adiciona {km_adicional:.1f}km <= {max_km_adicional}km)", flush=True)
-            else:
-                print(f"      ❌ Inviável (adiciona {km_adicional:.1f}km > {max_km_adicional}km)", flush=True)
-        
-        # Escolher o melhor candidato
-        if candidatos:
-            if prioridade_menor_km:
-                candidatos.sort(key=lambda c: c['km_adicional'])
-            elif prioridade_mais_perto:
-                candidatos.sort(key=lambda c: c['dist_direta'])
-            
-            melhor = candidatos[0]
-            truck_escolhido = melhor['truck_id']
-            
-            # Realocar o pedido
-            novas_rotas[truck_escolhido].append(exc_id)
-            novas_cargas[truck_escolhido] = novas_cargas.get(truck_escolhido, 0) + order.weight_kg
-            novo_served[exc_id] = truck_escolhido
-            
-            pedidos_realocados.append(PedidoRealocado(
-                id=exc_id,
-                cidade=order.city,
-                caminhao_original=caminhao_original,
-                caminhao_realocado=truck_escolhido,
-                distancia_adicional_km=round(melhor['km_adicional'], 2),
-                peso_kg=order.weight_kg,
-                motivo="excedente_capacidade"
-            ))
-            
-            print(f"   🎯 REALOCADO para Caminhão {truck_escolhido} (+{melhor['km_adicional']:.1f}km)", flush=True)
-        else:
-            excedentes_finais.append(exc_id)
-            print(f"   ⚠️ Mantido como EXCEDENTE (nenhum caminhão viável)", flush=True)
-    
+
+            exc_coords = order_coords.get(exc_id, (order.y, order.x))
+
+            for truck in trucks:
+                # Pular rota base do excedente (já sabemos que não coube)
+                if truck.id in city_to_trucks.get(order.city, []):
+                    continue
+
+                # Verificar capacidade
+                carga_atual = novas_cargas.get(truck.id, 0)
+                capacidade = truck.capacity_kg or CAPACIDADE_VEICULO_KG
+                if (capacidade - carga_atual) < order.weight_kg:
+                    continue
+
+                # Calcular distância com o excedente adicionado
+                rota_atual = novas_rotas.get(truck.id, [])
+                coords_com_exc = [depot_coords]
+                for oid in rota_atual:
+                    if oid in order_coords:
+                        coords_com_exc.append(order_coords[oid])
+                coords_com_exc.append(exc_coords)
+                coords_com_exc.append(depot_coords)
+
+                dist_com_exc = _calcular_distancia_rota_osrm_coords(coords_com_exc, osrm_url)
+                if dist_com_exc < 0:
+                    dist_com_exc = sum(
+                        _calcular_distancia_euclidiana(coords_com_exc[i], coords_com_exc[i + 1])
+                        for i in range(len(coords_com_exc) - 1)
+                    )
+
+                km_adicional = dist_com_exc - dist_atual_cache.get(truck.id, 0.0)
+                if km_adicional > max_km_adicional:
+                    continue
+
+                # Distância direta (para critério "mais perto")
+                dist_direta = _calcular_distancia_euclidiana(depot_coords, exc_coords)
+                if rota_atual:
+                    ultimo = order_coords.get(rota_atual[-1], depot_coords)
+                    dist_direta = min(dist_direta, _calcular_distancia_euclidiana(ultimo, exc_coords))
+
+                # Comparar com o melhor par atual
+                if melhor_par is None:
+                    melhor_par = (exc_id, truck.id, km_adicional, dist_direta)
+                else:
+                    if prioridade_menor_km:
+                        if km_adicional < melhor_par[2]:
+                            melhor_par = (exc_id, truck.id, km_adicional, dist_direta)
+                    elif prioridade_mais_perto:
+                        if dist_direta < melhor_par[3]:
+                            melhor_par = (exc_id, truck.id, km_adicional, dist_direta)
+
+        # Se não encontrou nenhum par viável, sai do loop
+        if melhor_par is None:
+            break
+
+        # Efetuar a realocação do melhor par
+        exc_id, truck_escolhido, km_add, _ = melhor_par
+        order = orders_by_id[exc_id]
+        caminhao_original = city_to_trucks.get(order.city, ["?"])[0]
+
+        novas_rotas[truck_escolhido].append(exc_id)
+        novas_cargas[truck_escolhido] = novas_cargas.get(truck_escolhido, 0) + order.weight_kg
+        novo_served[exc_id] = truck_escolhido
+        excedentes_restantes.discard(exc_id)
+
+        # Atualizar cache de distância do caminhão que recebeu o pedido
+        rota_atualizada = novas_rotas[truck_escolhido]
+        coords_upd = [depot_coords]
+        for oid in rota_atualizada:
+            if oid in order_coords:
+                coords_upd.append(order_coords[oid])
+        coords_upd.append(depot_coords)
+        d = _calcular_distancia_rota_osrm_coords(coords_upd, osrm_url)
+        if d < 0:
+            d = sum(_calcular_distancia_euclidiana(coords_upd[i], coords_upd[i + 1])
+                    for i in range(len(coords_upd) - 1))
+        dist_atual_cache[truck_escolhido] = d
+
+        pedidos_realocados.append(PedidoRealocado(
+            id=exc_id,
+            cidade=order.city,
+            caminhao_original=caminhao_original,
+            caminhao_realocado=truck_escolhido,
+            distancia_adicional_km=round(km_add, 2),
+            peso_kg=order.weight_kg,
+            motivo="excedente_capacidade",
+        ))
+
+        print(f"   REALOCADO: {exc_id} ({order.city}) -> Caminhao {truck_escolhido} (+{km_add:.1f}km)", flush=True)
+
+    excedentes_finais = list(excedentes_restantes)
+
     print(f"\n{'='*50}", flush=True)
-    print(f"📊 RESULTADO DA REALOCAÇÃO:", flush=True)
-    print(f"   ✅ Realocados: {len(pedidos_realocados)}", flush=True)
-    print(f"   ⚠️ Excedentes finais: {len(excedentes_finais)}", flush=True)
+    print(f"RESULTADO DA REALOCACAO:", flush=True)
+    print(f"   Realocados: {len(pedidos_realocados)}", flush=True)
+    print(f"   Excedentes finais: {len(excedentes_finais)}", flush=True)
     print(f"{'='*50}\n", flush=True)
-    
+
     # ===========================================
-    # ETAPA 4: REORDENAR ROTAS QUE RECEBERAM REALOCAÇÕES
+    # REORDENAR ROTAS QUE RECEBERAM REALOCAÇÕES (TSP)
     # ===========================================
     if pedidos_realocados:
         caminhoes_afetados = {pr.caminhao_realocado for pr in pedidos_realocados}
-        
+
         print(f"\n{'='*50}", flush=True)
-        print(f"🔄 ETAPA 4: REORDENANDO ROTAS AFETADAS", flush=True)
+        print(f"[TSP] REORDENANDO ROTAS AFETADAS", flush=True)
         print(f"{'='*50}", flush=True)
-        print(f"📦 Rotas a reotimizar: {len(caminhoes_afetados)} ({', '.join(sorted(caminhoes_afetados))})", flush=True)
-        
+        print(f"Rotas a reotimizar: {len(caminhoes_afetados)} ({', '.join(sorted(caminhoes_afetados))})", flush=True)
+
         for truck_id in caminhoes_afetados:
             rota_atual = novas_rotas.get(truck_id, [])
             if len(rota_atual) >= 2:
-                print(f"\n   🚛 Caminhão {truck_id}: reordenando {len(rota_atual)} paradas...", flush=True)
-                print(f"      Ordem atual: {rota_atual}", flush=True)
-                
+                print(f"   Caminhao {truck_id}: reordenando {len(rota_atual)} paradas...", flush=True)
                 rota_otimizada = reordenar_rota_tsp(
                     order_ids=rota_atual,
                     order_coords=order_coords,
                     depot_coords=depot_coords,
                     osrm_url=osrm_url,
                 )
-                
                 novas_rotas[truck_id] = rota_otimizada
                 print(f"      Ordem otimizada: {rota_otimizada}", flush=True)
-            else:
-                print(f"\n   🚛 Caminhão {truck_id}: apenas {len(rota_atual)} parada(s), sem necessidade de reordenar", flush=True)
-        
-        print(f"\n{'='*50}", flush=True)
-        print(f"✅ REORDENAÇÃO CONCLUÍDA!", flush=True)
+
         print(f"{'='*50}\n", flush=True)
-    
+
     # Criar novo SolveResult
     novo_result = SolveResult(
-        objective=res_etapa1.objective,  # Mantém objetivo original (poderia recalcular)
+        objective=res_etapa1.objective,
         dropped_orders=excedentes_finais,
         served_by_truck=novo_served,
         routes=novas_rotas,
         loads_by_truck=novas_cargas,
     )
-    
+
     return novo_result, pedidos_realocados
 
 
@@ -903,19 +758,17 @@ def plan_day_two_stage(
     orders: List[Order],
     trucks: List[Truck],
     depot_xy: Tuple[float, float],
-    # Ajustes principais:
-    open_cost_step: int = 1_000_000,        # quão caro é "abrir" o 2º caminhão da mesma rota
-    stage1_drop_penalty: int = 50_000_000,  # altíssimo: só vira excedente se NÃO couber mesmo
-    stage2_drop_penalty: int = 2_000_000,   # custo de deixar como excedente final
-    stage2_move_penalty: int = 200_000,     # custo operacional por remanejamento fora da base
-    time_limit_seconds: int = 10,
-    # Novos parâmetros para realocação inteligente
-    max_km_adicional_realocacao: float = 50.0,
-    prioridade_menor_km: bool = True,
-    prioridade_mais_perto: bool = False,
-    osrm_url: str = "http://router.project-osrm.org",
-    order_coords: Optional[Dict[str, Tuple[float, float]]] = None,  # order_id -> (lat, lng)
-    depot_coords: Optional[Tuple[float, float]] = None,  # (lat, lng)
+    depot_coords: Tuple[float, float],
+    order_coords: Dict[str, Tuple[float, float]],
+    open_cost_step: Optional[int] = None,
+    stage1_drop_penalty: Optional[int] = None,
+    stage2_drop_penalty: Optional[int] = None,
+    stage2_move_penalty: Optional[int] = None,
+    time_limit_seconds: Optional[int] = None,
+    max_km_adicional_realocacao: Optional[float] = None,
+    prioridade_menor_km: Optional[bool] = None,
+    prioridade_mais_perto: Optional[bool] = None,
+    osrm_url: Optional[str] = None,
 ) -> Tuple[SolveResult, SolveResult, List[PedidoRealocado]]:
     """
     Etapa 1: respeita base (listas de cidades) e prioriza 1º caminhão do grupo.
@@ -923,7 +776,36 @@ def plan_day_two_stage(
 
     Etapa 2: pedidos não excedentes ficam travados na base.
              apenas pedidos excedentes podem ir para alt_truck_ids (se compensar).
+
+    Etapa 3: realocação inteligente de excedentes em caminhões com espaço.
+
+    Todos os defaults vêm do config/settings.py e podem ser sobrescritos via params.
     """
+    from config.settings import (
+        OPEN_COST_STEP, STAGE1_DROP_PENALTY, STAGE2_DROP_PENALTY,
+        STAGE2_MOVE_PENALTY, TEMPO_LIMITE_SOLVER_SEGUNDOS,
+        MAX_KM_ADICIONAL_REALOCACAO, PRIORIDADE_MENOR_KM_ADICIONAL,
+        PRIORIDADE_MAIS_PERTO, OSRM_URL,
+    )
+
+    # Aplica defaults do settings.py quando não fornecido via params
+    open_cost_step = open_cost_step if open_cost_step is not None else OPEN_COST_STEP
+    stage1_drop_penalty = stage1_drop_penalty if stage1_drop_penalty is not None else STAGE1_DROP_PENALTY
+    stage2_drop_penalty = stage2_drop_penalty if stage2_drop_penalty is not None else STAGE2_DROP_PENALTY
+    stage2_move_penalty = stage2_move_penalty if stage2_move_penalty is not None else STAGE2_MOVE_PENALTY
+    time_limit_seconds = time_limit_seconds if time_limit_seconds is not None else TEMPO_LIMITE_SOLVER_SEGUNDOS
+    max_km_adicional_realocacao = max_km_adicional_realocacao if max_km_adicional_realocacao is not None else MAX_KM_ADICIONAL_REALOCACAO
+    prioridade_menor_km = prioridade_menor_km if prioridade_menor_km is not None else PRIORIDADE_MENOR_KM_ADICIONAL
+    prioridade_mais_perto = prioridade_mais_perto if prioridade_mais_perto is not None else PRIORIDADE_MAIS_PERTO
+    osrm_url = osrm_url if osrm_url is not None else OSRM_URL
+
+    # Construir matriz de custo via OSRM (distâncias reais de estrada)
+    cost_matrix = _build_osrm_cost_matrix(orders, depot_coords, order_coords)
+    if cost_matrix is not None:
+        print(f"[OK] Matriz OSRM calculada ({len(cost_matrix)}x{len(cost_matrix)})", flush=True)
+    else:
+        print("[WARN] OSRM falhou, usando distância euclidiana como fallback.", flush=True)
+
     city_base = city_to_base_trucks(trucks)
 
     # base trucks por pedido
@@ -946,7 +828,7 @@ def plan_day_two_stage(
         orders=orders,
         trucks=trucks,
         depot_xy=depot_xy,
-        cost_matrix=None,
+        cost_matrix=cost_matrix,
         allowed_trucks_per_order=allowed_1,
         drop_penalty_per_order=drop_1,
         vehicle_fixed_costs=vehicle_fixed,
@@ -981,7 +863,7 @@ def plan_day_two_stage(
         orders=orders,
         trucks=trucks,
         depot_xy=depot_xy,
-        cost_matrix=None,
+        cost_matrix=cost_matrix,
         allowed_trucks_per_order=allowed_2,
         drop_penalty_per_order=drop_2,
         vehicle_fixed_costs=vehicle_fixed,
@@ -995,7 +877,7 @@ def plan_day_two_stage(
     # -------------------
     pedidos_realocados: List[PedidoRealocado] = []
     
-    if res2.dropped_orders and order_coords and depot_coords:
+    if res2.dropped_orders:
         print(f"\n[ETAPA 3] Iniciando realocação inteligente de {len(res2.dropped_orders)} excedentes...", flush=True)
         
         res2, pedidos_realocados = realocar_excedentes_inteligente(
@@ -1009,8 +891,6 @@ def plan_day_two_stage(
             prioridade_mais_perto=prioridade_mais_perto,
             osrm_url=osrm_url,
         )
-    elif res2.dropped_orders:
-        print(f"\n[ETAPA 3] Realocação desabilitada (sem coordenadas). Excedentes mantidos: {len(res2.dropped_orders)}", flush=True)
 
     return res1, res2, pedidos_realocados
 
