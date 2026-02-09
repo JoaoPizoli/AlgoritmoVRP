@@ -1,8 +1,3 @@
-"""
-Serviço de comunicação com o OSRM (Open Source Routing Machine).
-Responsável por obter matriz de distâncias e geometria das rotas.
-"""
-
 import requests
 from config.settings import ( OSRM_URL, OSRM_BATCH_SIZE )
 
