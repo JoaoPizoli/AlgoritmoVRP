@@ -145,6 +145,7 @@ def solve_vrp(
     vehicle_fixed_costs: Optional[Dict[str, int]] = None,
     base_trucks_per_order: Optional[Dict[str, Set[str]]] = None,
     move_penalty_if_outside_base: int = 0,
+    city_switch_penalty: int = 0,
     time_limit_seconds: int = 10,
 ) -> SolveResult:
     """
@@ -154,6 +155,7 @@ def solve_vrp(
       - pedidos opcionais com penalidade (AddDisjunction) => EXCEDENTE
       - custo fixo por veículo (SetFixedCostOfVehicle) => prioriza abrir o 1º antes do 2º
       - penalidade de remanejamento (move_penalty) se pedido for atendido fora do conjunto base
+      - penalidade de troca de cidade (city_switch_penalty) para agrupar entregas da mesma cidade
     """
 
     # Mapeia truck_id -> vehicle_index do OR-Tools
@@ -203,6 +205,10 @@ def solve_vrp(
             for tid in base_set:
                 is_base[i][truck_id_to_vid[tid]] = True
 
+    # (C.2) Pré-computa cidade de cada nó para penalidade de troca de cidade
+    # node_city[0] = None (depósito), node_city[i] = orders[i-1].city
+    node_city: List[Optional[str]] = [None] + [o.city for o in orders]
+
     for vid in range(len(trucks)):
         def make_arc_cb(vehicle_id: int):
             def arc_cost(from_index: int, to_index: int) -> int:
@@ -215,6 +221,13 @@ def solve_vrp(
                 if move_penalty_if_outside_base > 0 and is_base is not None and to_node != 0:
                     if not is_base[to_node][vehicle_id]:
                         base_cost += move_penalty_if_outside_base
+
+                # Penalidade de troca de cidade: se saímos de um pedido em cidade A
+                # para um pedido em cidade B (ambas != depósito e cidades diferentes),
+                # soma penalidade para incentivar agrupamento por cidade.
+                if city_switch_penalty > 0 and from_node != 0 and to_node != 0:
+                    if node_city[from_node] != node_city[to_node]:
+                        base_cost += city_switch_penalty
 
                 return base_cost
             return arc_cost
@@ -410,6 +423,8 @@ def reordenar_rota_tsp(
     order_coords: Dict[str, Tuple[float, float]],
     depot_coords: Tuple[float, float],
     osrm_url: str = "http://router.project-osrm.org",
+    order_cities: Optional[Dict[str, str]] = None,
+    city_switch_penalty: int = 0,
 ) -> List[str]:
     """
     Reordena pedidos de uma rota usando TSP via OR-Tools.
@@ -420,6 +435,8 @@ def reordenar_rota_tsp(
         order_coords: Dict order_id -> (lat, lng)
         depot_coords: (lat, lng) do depósito
         osrm_url: URL do servidor OSRM
+        order_cities: Dict order_id -> cidade (para penalidade de troca)
+        city_switch_penalty: Penalidade em metros ao trocar de cidade
     
     Returns:
         Lista de order_ids na sequência otimizada
@@ -468,6 +485,13 @@ def reordenar_rota_tsp(
         print(f"[WARN] OSRM falhou para TSP, usando euclidiana: {e}", flush=True)
         cost_matrix = _build_euclidean_matrix(coords_list)
     
+    # Pré-computa cidade de cada nó TSP para penalidade de troca
+    # tsp_city[0] = None (depot), tsp_city[i] = cidade do valid_ids[i-1]
+    tsp_city: List[Optional[str]] = [None]
+    if order_cities and city_switch_penalty > 0:
+        for oid in valid_ids:
+            tsp_city.append(order_cities.get(oid))
+
     # Resolver TSP com OR-Tools
     manager = pywrapcp.RoutingIndexManager(n, 1, 0)  # 1 veículo, depot no index 0
     routing = pywrapcp.RoutingModel(manager)
@@ -475,7 +499,13 @@ def reordenar_rota_tsp(
     def distance_callback(from_index, to_index):
         from_node = manager.IndexToNode(from_index)
         to_node = manager.IndexToNode(to_index)
-        return cost_matrix[from_node][to_node]
+        base = cost_matrix[from_node][to_node]
+        # Penalidade de troca de cidade no TSP
+        if city_switch_penalty > 0 and len(tsp_city) > max(from_node, to_node):
+            if from_node != 0 and to_node != 0:
+                if tsp_city[from_node] != tsp_city[to_node]:
+                    base += city_switch_penalty
+        return base
     
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
@@ -690,6 +720,10 @@ def realocar_excedentes_inteligente(
         print(f"{'='*50}", flush=True)
         print(f"Rotas a reotimizar: {len(caminhoes_afetados)} ({', '.join(sorted(caminhoes_afetados))})", flush=True)
 
+        # Montar dicionário de cidades para o TSP respeitar agrupamento
+        order_cities_dict = {o.id: o.city for o in orders}
+        from config.settings import PENALIDADE_TROCA_CIDADE
+
         for truck_id in caminhoes_afetados:
             rota_atual = novas_rotas.get(truck_id, [])
             if len(rota_atual) >= 2:
@@ -699,6 +733,8 @@ def realocar_excedentes_inteligente(
                     order_coords=order_coords,
                     depot_coords=depot_coords,
                     osrm_url=osrm_url,
+                    order_cities=order_cities_dict,
+                    city_switch_penalty=PENALIDADE_TROCA_CIDADE,
                 )
                 novas_rotas[truck_id] = rota_otimizada
                 print(f"      Ordem otimizada: {rota_otimizada}", flush=True)
@@ -768,7 +804,7 @@ def plan_day_two_stage(
         OPEN_COST_STEP, STAGE1_DROP_PENALTY, STAGE2_DROP_PENALTY,
         STAGE2_MOVE_PENALTY, TEMPO_LIMITE_SOLVER_SEGUNDOS,
         MAX_KM_ADICIONAL_REALOCACAO, PRIORIDADE_MENOR_KM_ADICIONAL,
-        PRIORIDADE_MAIS_PERTO, OSRM_URL,
+        PRIORIDADE_MAIS_PERTO, OSRM_URL, PENALIDADE_TROCA_CIDADE,
     )
 
     # Aplica defaults do settings.py quando não fornecido via params
@@ -822,6 +858,7 @@ def plan_day_two_stage(
         vehicle_fixed_costs=vehicle_fixed,
         base_trucks_per_order=None,
         move_penalty_if_outside_base=0,
+        city_switch_penalty=PENALIDADE_TROCA_CIDADE,
         time_limit_seconds=time_limit_seconds,
     )
 
@@ -857,6 +894,7 @@ def plan_day_two_stage(
         vehicle_fixed_costs=vehicle_fixed,
         base_trucks_per_order=base_trucks_per_order,
         move_penalty_if_outside_base=stage2_move_penalty,
+        city_switch_penalty=PENALIDADE_TROCA_CIDADE,
         time_limit_seconds=time_limit_seconds,
     )
 

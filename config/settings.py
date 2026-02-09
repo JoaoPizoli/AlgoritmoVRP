@@ -35,6 +35,13 @@ FIRST_SOLUTION_STRATEGY = 'PATH_CHEAPEST_ARC'
 # Opções: GUIDED_LOCAL_SEARCH, SIMULATED_ANNEALING, TABU_SEARCH
 METODO_BUSCA_LOCAL = 'GUIDED_LOCAL_SEARCH'
 
+# Penalidade por troca de cidade na sequência de entrega (em metros).
+# Faz o solver agrupar todas as entregas da mesma cidade em sequência.
+# Ex: 100_000 = equivale a 100km de "custo fictício" a cada troca de cidade.
+# Quanto maior, mais forte o agrupamento (mas pode gerar rotas levemente mais longas).
+# Use 0 para desativar.
+PENALIDADE_TROCA_CIDADE = 100_000
+
 # =============================================================================
 # 3. REALOCAÇÃO DE EXCEDENTES
 # =============================================================================
