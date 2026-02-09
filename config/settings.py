@@ -42,6 +42,13 @@ METODO_BUSCA_LOCAL = 'GUIDED_LOCAL_SEARCH'
 # Use 0 para desativar.
 PENALIDADE_TROCA_CIDADE = 100_000
 
+# Quantidade mínima de pedidos em uma cidade para ativar a regra de
+# "cidade pesada primeiro": se a última cidade da rota tiver >= este número
+# de pedidos, ela é movida para o INÍCIO da rota.
+# Isso evita que o caminhão deixe o grosso das entregas pro final do dia.
+# Use 0 para desativar.
+MIN_PEDIDOS_CIDADE_PRIORIDADE = 15
+
 # =============================================================================
 # 3. REALOCAÇÃO DE EXCEDENTES
 # =============================================================================

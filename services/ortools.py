@@ -753,6 +753,47 @@ def realocar_excedentes_inteligente(
     return novo_result, pedidos_realocados
 
 
+def _reordenar_cidade_pesada_primeiro(
+    route_order_ids: List[str],
+    orders_by_id: Dict[str, Order],
+    min_pedidos: int = 15,
+) -> List[str]:
+    """
+    Pós-processamento: se a última cidade visitada na rota tem >= min_pedidos,
+    move TODOS os pedidos dessa cidade para o início da rota.
+    Mantém a ordem relativa dos demais pedidos.
+
+    Lógica:
+      1. Identifica a cidade do último pedido da rota.
+      2. Conta quantos pedidos dessa cidade existem na rota inteira.
+      3. Se >= min_pedidos, separa em [pedidos_cidade_pesada] + [restante].
+    """
+    if not route_order_ids or min_pedidos <= 0:
+        return route_order_ids
+
+    # Cidade do último pedido
+    last_order = orders_by_id.get(route_order_ids[-1])
+    if not last_order:
+        return route_order_ids
+    last_city = last_order.city
+
+    # Conta total de pedidos dessa cidade na rota
+    city_ids = [oid for oid in route_order_ids
+                if orders_by_id.get(oid) and orders_by_id[oid].city == last_city]
+
+    if len(city_ids) < min_pedidos:
+        return route_order_ids
+
+    # Move todos os pedidos da cidade pesada para o início
+    city_set = set(city_ids)
+    other_ids = [oid for oid in route_order_ids if oid not in city_set]
+
+    print(f"      [CIDADE-PESADA] '{last_city}' tem {len(city_ids)} pedidos (>= {min_pedidos}) "
+          f"e era a última -> movida para o INÍCIO da rota", flush=True)
+
+    return city_ids + other_ids
+
+
 # =========================
 # 6) SEU FLUXO (2 ETAPAS)
 # =========================
@@ -805,6 +846,7 @@ def plan_day_two_stage(
         STAGE2_MOVE_PENALTY, TEMPO_LIMITE_SOLVER_SEGUNDOS,
         MAX_KM_ADICIONAL_REALOCACAO, PRIORIDADE_MENOR_KM_ADICIONAL,
         PRIORIDADE_MAIS_PERTO, OSRM_URL, PENALIDADE_TROCA_CIDADE,
+        MIN_PEDIDOS_CIDADE_PRIORIDADE,
     )
 
     # Aplica defaults do settings.py quando não fornecido via params
@@ -919,5 +961,16 @@ def plan_day_two_stage(
             prioridade_mais_perto=prioridade_mais_perto,
             osrm_url=osrm_url,
         )
+
+    # -------------------
+    # ETAPA 4: PÓS-PROCESSAMENTO — Cidade pesada primeiro
+    # -------------------
+    if MIN_PEDIDOS_CIDADE_PRIORIDADE > 0:
+        orders_by_id = {o.id: o for o in orders}
+        for truck_id, rota in res2.routes.items():
+            if rota:
+                res2.routes[truck_id] = _reordenar_cidade_pesada_primeiro(
+                    rota, orders_by_id, MIN_PEDIDOS_CIDADE_PRIORIDADE,
+                )
 
     return res1, res2, pedidos_realocados
